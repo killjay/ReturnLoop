@@ -375,6 +375,16 @@ async def handle_shopify_return(request: Request):
             order.status = "return_requested"
             await db.commit()
 
+        # Look up product SKU from DB for Loop Matcher matching
+        product_sku = ""
+        if product_id:
+            async with async_session() as sku_db:
+                from backend.models.product import Product as ProdModel
+                sku_result = await sku_db.execute(select(ProdModel).where(or_(ProdModel.id == product_id, ProdModel.id == f"shopify-{product_id}")))
+                sku_prod = sku_result.scalars().first()
+                if sku_prod:
+                    product_sku = sku_prod.sku or ""
+
         # Emit event to trigger pipeline
         await event_bus.emit(Event(
             event_type=RETURN_INITIATED,
@@ -385,7 +395,7 @@ async def handle_shopify_return(request: Request):
                 "customer_ltv": enriched.get("lifetime_value", 0),
                 "customer_return_rate": 0.1,
                 "product_name": enriched.get("product_name", "Product"),
-                "product_sku": "", "product_price": enriched.get("product_price", 0),
+                "product_sku": product_sku, "product_price": enriched.get("product_price", 0),
                 "product_return_rate": 0.12,
                 "size": enriched.get("size", "M"),
                 "latitude": latitude, "longitude": longitude,
