@@ -312,7 +312,7 @@ async def handle_shopify_return(request: Request):
         async with async_session() as db:
             # Idempotency
             existing = await db.execute(select(ReturnRequest).where(ReturnRequest.order_id == shopify_order_id))
-            if existing.scalar_one_or_none():
+            if existing.scalars().first():
                 return {"status": "skipped", "reason": "Return already exists"}
 
             # Get or create customer/product/order using enriched data
@@ -326,7 +326,7 @@ async def handle_shopify_return(request: Request):
             # Ensure customer exists
             if customer_id:
                 cust_check = await db.execute(select(Customer).where(or_(Customer.id == customer_id, Customer.id == f"shopify-{customer_id}")))
-                existing_cust = cust_check.scalar_one_or_none()
+                existing_cust = cust_check.scalars().first()
                 if existing_cust:
                     customer_id = existing_cust.id
                 else:
@@ -340,7 +340,7 @@ async def handle_shopify_return(request: Request):
             # Ensure product exists
             if product_id:
                 prod_check = await db.execute(select(Product).where(or_(Product.id == product_id, Product.id == f"shopify-{product_id}")))
-                existing_prod = prod_check.scalar_one_or_none()
+                existing_prod = prod_check.scalars().first()
                 if existing_prod:
                     product_id = existing_prod.id
                 else:
@@ -351,7 +351,7 @@ async def handle_shopify_return(request: Request):
 
             # Ensure order exists
             order_check = await db.execute(select(Order).where(or_(Order.id == shopify_order_id, Order.id == f"shopify-{shopify_order_id}")))
-            existing_order = order_check.scalar_one_or_none()
+            existing_order = order_check.scalars().first()
             if existing_order:
                 order = existing_order
             else:
@@ -498,7 +498,7 @@ async def handle_shopify_return(request: Request):
         existing_return = await db.execute(
             select(ReturnRequest).where(ReturnRequest.order_id == order_id)
         )
-        if existing_return.scalar_one_or_none():
+        if existing_return.scalars().first():
             return {"status": "skipped", "reason": "Return already exists for this order"}
 
         # FIX 1: Look up order by both raw ID and prefixed ID
@@ -507,7 +507,7 @@ async def handle_shopify_return(request: Request):
                 or_(Order.id == order_id, Order.id == f"shopify-{order_id}")
             )
         )
-        order = result.scalar_one_or_none()
+        order = result.scalars().first()
 
         # === Ensure ALL FK dependencies exist (PostgreSQL enforces strictly) ===
 
@@ -521,7 +521,7 @@ async def handle_shopify_return(request: Request):
                     or_(Customer.id == customer_id, Customer.id == f"shopify-{customer_id}")
                 )
             )
-            existing_customer = cust_check.scalar_one_or_none()
+            existing_customer = cust_check.scalars().first()
             if existing_customer:
                 # Use the actual ID from DB (might be prefixed)
                 customer_id = existing_customer.id
@@ -553,7 +553,7 @@ async def handle_shopify_return(request: Request):
                     or_(Product.id == webhook_product_id, Product.id == f"shopify-{webhook_product_id}")
                 )
             )
-            existing_product = prod_check.scalar_one_or_none()
+            existing_product = prod_check.scalars().first()
             if existing_product:
                 webhook_product_id = existing_product.id
                 print(f"  Found existing product: {webhook_product_id}")
@@ -631,7 +631,7 @@ async def handle_shopify_return(request: Request):
                 or_(Customer.id == customer_id, Customer.id == f"shopify-{customer_id}")
             )
         )
-        customer = cust_result.scalar_one_or_none()
+        customer = cust_result.scalars().first()
 
         # FIX 1: Look up product by both raw ID and prefixed ID
         product_id = order.product_id or ""
@@ -640,7 +640,7 @@ async def handle_shopify_return(request: Request):
                 or_(Product.id == product_id, Product.id == f"shopify-{product_id}")
             )
         )
-        product = prod_result.scalar_one_or_none()
+        product = prod_result.scalars().first()
 
         # Create return request
         return_request = ReturnRequest(

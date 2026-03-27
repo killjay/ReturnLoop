@@ -143,9 +143,13 @@ export default function DataSourcePanel() {
             </div>
             <button
               onClick={() => setActiveSource(activeSource === 'shopify' ? null : 'shopify')}
-              className="text-xs bg-gray-700 text-gray-300 px-3 py-1.5 rounded-md hover:bg-gray-600 transition-colors"
+              className={`text-xs px-3 py-1.5 rounded-md transition-colors ${
+                status?.connected_sources?.includes('shopify')
+                  ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-500/40 hover:bg-emerald-600/30'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              }`}
             >
-              {activeSource === 'shopify' ? 'Cancel' : 'Connect'}
+              {activeSource === 'shopify' ? 'Cancel' : status?.connected_sources?.includes('shopify') ? 'Synced ✓' : 'Connect'}
             </button>
           </div>
           {activeSource === 'shopify' && (
