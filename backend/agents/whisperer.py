@@ -36,12 +36,16 @@ class WhispererAgent(BaseAgent):
         """
         self.reset_steps()
 
+        customer_name = payload.get("customer_name", "Unknown Customer")
+        product_name = payload.get("product_name", "Unknown Product")
+        order_id = payload.get("order_id", "")
+
         # Step 1: Pull customer context
         await self.think(
             return_request_id=return_request_id,
             action="pull_customer_context",
-            reasoning=f"Loading customer profile for {payload.get('customer_name', 'unknown')}",
-            data_used={"customer_id": payload.get("customer_id")},
+            reasoning=f"Return initiated by {customer_name} for '{product_name}' (Order {order_id}). Loading customer profile...",
+            data_used={"customer_name": customer_name, "order_id": order_id, "product_name": product_name},
             confidence=1.0,
         )
 
@@ -55,9 +59,10 @@ class WhispererAgent(BaseAgent):
         await self.think(
             return_request_id=return_request_id,
             action="analyze_customer_history",
-            reasoning=f"Customer LTV: ${customer_ltv:.2f} ({ltv_tier}). Return rate: {customer_return_rate*100:.0f}%. Product return rate: {product_return_rate*100:.0f}%.",
+            reasoning=f"{customer_name}: LTV ${customer_ltv:.2f} ({ltv_tier}). Return rate: {customer_return_rate*100:.0f}%. '{product_name}' return rate: {product_return_rate*100:.0f}%.",
             decision=f"Customer tier: {ltv_tier}",
             data_used={
+                "customer_name": customer_name,
                 "lifetime_value": customer_ltv,
                 "return_rate": customer_return_rate,
                 "product_return_rate": product_return_rate,
@@ -124,8 +129,8 @@ What negotiation strategy should I use?"""
             await self.think(
                 return_request_id=return_request_id,
                 action="no_phone_number",
-                reasoning=f"No valid phone number available for {payload.get('customer_name')}. Proceeding with simulated negotiation.",
-                data_used={"phone": customer_phone},
+                reasoning=f"No valid phone number for {customer_name} (Order {order_id}). Proceeding with simulated negotiation.",
+                data_used={"customer_name": customer_name, "phone": customer_phone},
                 confidence=0.50,
             )
             customer_phone = ""  # Force mock path
@@ -133,8 +138,8 @@ What negotiation strategy should I use?"""
         await self.think(
             return_request_id=return_request_id,
             action="initiate_voice_call",
-            reasoning=f"Initiating voice call to {payload.get('customer_name')} at {customer_phone or 'N/A'}. Strategy: {strategy}.",
-            data_used={"phone": customer_phone, "strategy": strategy},
+            reasoning=f"Calling {customer_name} at {customer_phone or 'N/A'} about '{product_name}' (Order {order_id}). Strategy: {strategy}.",
+            data_used={"customer_name": customer_name, "phone": customer_phone, "strategy": strategy, "product_name": product_name},
             confidence=0.95,
         )
 
