@@ -27,6 +27,31 @@ export default function AgentTrace({ traces }) {
     );
   }
 
+  // Group traces by return_request_id and extract context
+  const groups = [];
+  let currentGroup = null;
+  for (const trace of traces) {
+    const rid = trace.return_request_id || '';
+    if (!currentGroup || currentGroup.rid !== rid) {
+      // Extract customer name and order ID from data_used
+      const d = trace.data_used || {};
+      currentGroup = {
+        rid,
+        customerName: d.customer_name || '',
+        orderId: d.order_id || '',
+        productName: d.product_name || '',
+        traces: [],
+      };
+      groups.push(currentGroup);
+    }
+    currentGroup.traces.push(trace);
+    // Update context from later traces if earlier ones didn't have it
+    const d = trace.data_used || {};
+    if (d.customer_name && !currentGroup.customerName) currentGroup.customerName = d.customer_name;
+    if (d.order_id && !currentGroup.orderId) currentGroup.orderId = d.order_id;
+    if (d.product_name && !currentGroup.productName) currentGroup.productName = d.product_name;
+  }
+
   return (
     <div className="p-4 space-y-2 max-h-[calc(100vh-200px)] overflow-y-auto">
       <div className="flex items-center justify-between mb-2">
@@ -34,7 +59,23 @@ export default function AgentTrace({ traces }) {
         <span className="text-xs text-gray-600">{traces.length} steps</span>
       </div>
 
-      {traces.map((trace, i) => {
+      {groups.map((group, gi) => (
+        <div key={group.rid || gi}>
+          {/* Return context header */}
+          {(group.customerName || group.orderId) && (
+            <div className="flex items-center gap-3 mb-2 mt-4 first:mt-0 px-1">
+              <div className="w-6 h-6 rounded-full bg-gray-800 flex items-center justify-center text-xs text-white font-bold">
+                {(group.customerName || '?')[0].toUpperCase()}
+              </div>
+              <div>
+                <span className="text-sm font-semibold text-white">{group.customerName || 'Customer'}</span>
+                {group.orderId && <span className="text-xs text-gray-500 ml-2">Order {group.orderId}</span>}
+                {group.productName && <span className="text-xs text-gray-600 ml-2">· {group.productName}</span>}
+              </div>
+            </div>
+          )}
+
+          {group.traces.map((trace, i) => {
         const colors = AGENT_COLORS[trace.agent_name] || AGENT_COLORS.prophet;
         const label = AGENT_LABELS[trace.agent_name] || trace.agent_name;
 
@@ -70,6 +111,8 @@ export default function AgentTrace({ traces }) {
           </div>
         );
       })}
+        </div>
+      ))}
     </div>
   );
 }

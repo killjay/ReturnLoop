@@ -22,7 +22,18 @@ class ShopifyService:
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.store_url and self.api_token)
+        return bool(self.store_url and self._get_token())
+
+    def _get_token(self) -> str:
+        """Get the best available token -- prefer OAuth over static."""
+        if self.api_token:
+            return self.api_token
+        # Fall back to OAuth token
+        try:
+            from backend.api.shopify_oauth import get_oauth_token
+            return get_oauth_token()
+        except Exception:
+            return ""
 
     @property
     def base_url(self) -> str:
@@ -31,8 +42,9 @@ class ShopifyService:
     async def _api_call(self, method: str, endpoint: str, data: dict = None) -> Optional[dict]:
         """Make a Shopify API call via curl (bypasses SSL issues)."""
         url = f"{self.base_url}/{endpoint}"
+        token = self._get_token()
         cmd = ["curl", "-s", "-X", method, url,
-               "-H", f"X-Shopify-Access-Token: {self.api_token}",
+               "-H", f"X-Shopify-Access-Token: {token}",
                "-H", "Content-Type: application/json"]
 
         if data:
