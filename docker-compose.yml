@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: returnloop-postgres
+    environment:
+      POSTGRES_DB: returnloop
+      POSTGRES_USER: returnloop
+      POSTGRES_PASSWORD: returnloop
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  aerospike:
+    image: aerospike/aerospike-server:latest
+    container_name: returnloop-aerospike
+    command: ["asd", "--foreground", "--config-file", "/opt/custom/aerospike.conf"]
+    ports:
+      - "3100:3000"
+      - "3101:3001"
+      - "3102:3002"
+    volumes:
+      - ./aerospike.conf:/opt/custom/aerospike.conf
+      - aerospike_data:/opt/aerospike/data
+
+volumes:
+  postgres_data:
+  aerospike_data:

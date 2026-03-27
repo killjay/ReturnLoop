@@ -1,0 +1,19 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "fcd173eaaa9a4f54d4ddc9ed1f519114"
+name = "Return Stuff"
+application_url = "https://2062-2001-1890-12e7-ce0-f5c9-53a9-69a9-5df0.ngrok-free.app"
+embedded = false
+
+[build]
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2024-10"
+
+[access_scopes]
+scopes = "read_orders,read_customers,write_orders,read_products,read_returns,write_returns"
+use_legacy_install_flow = true
+
+[auth]
+redirect_urls = [ "https://2062-2001-1890-12e7-ce0-f5c9-53a9-69a9-5df0.ngrok-free.app/shopify/auth/callback" ]
