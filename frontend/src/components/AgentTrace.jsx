@@ -119,11 +119,12 @@ export default function AgentTrace({ traces }) {
 
 function DataBadges({ data }) {
   const displayKeys = ['cost_saved', 'miles_saved', 'co2_saved_kg', 'risk_score', 'distance_miles',
-    'lifetime_value', 'return_rate', 'sizing_complaint_pct', 'direct_miles', 'warehouse_miles'];
+    'lifetime_value', 'return_rate', 'sizing_complaint_pct', 'direct_miles', 'warehouse_miles',
+    'target_customer', 'target_city'];
 
   const badges = Object.entries(data)
     .filter(([key]) => displayKeys.includes(key))
-    .slice(0, 4);
+    .slice(0, 6);
 
   if (badges.length === 0) return null;
 

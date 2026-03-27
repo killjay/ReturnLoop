@@ -170,7 +170,7 @@ class ShopifyService:
         if tracking_number:
             payload["fulfillment"]["tracking_info"] = {"number": tracking_number}
         if note:
-            payload["fulfillment"]["origin_address"] = {}  # required field placeholder
+            payload["fulfillment"]["message"] = note
 
         result = await self._api_call("POST", "fulfillments.json", payload)
         if result and "fulfillment" in result:
