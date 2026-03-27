@@ -75,7 +75,7 @@ class AerospikeClient:
         size: str,
         latitude: float,
         longitude: float,
-        radius_miles: float = 50.0,
+        radius_miles: float = 2500.0,
         exclude_customer_id: str = None,
     ) -> List[dict]:
         """Find nearby orders for the same product SKU within radius.

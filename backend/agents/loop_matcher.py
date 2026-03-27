@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.agents.base_agent import BaseAgent
 from backend.services.aerospike_client import aerospike_client
+from backend.services.airbyte_client import airbyte_service
 from backend.services.overmind_client import overmind_client
 from backend.models.return_request import ReturnRequest
 from backend.models.routing_decision import RoutingDecision
@@ -44,15 +45,18 @@ class LoopMatcherAgent(BaseAgent):
         source_lat = payload.get("latitude", 0)
         source_lon = payload.get("longitude", 0)
         product_sku = payload.get("product_sku", "")
+        product_name = payload.get("product_name", "")
         size = payload.get("size", "")
         customer_id = payload.get("customer_id", "")
+        customer_name = payload.get("customer_name", "Customer")
+        order_id = payload.get("order_id", "")
 
         # Step 1: Search for nearby matching orders
         await self.think(
             return_request_id=return_request_id,
             action="search_nearby_orders",
-            reasoning=f"Searching for pending/shipped orders matching SKU '{product_sku}' size '{size}' within 50 miles of ({source_lat:.4f}, {source_lon:.4f})",
-            data_used={"sku": product_sku, "size": size, "radius_miles": 50},
+            reasoning=f"Finding nearby customers who ordered '{product_name}' (SKU: {product_sku}, size: {size}) within 2500 miles of {customer_name}'s location.",
+            data_used={"customer_name": customer_name, "order_id": order_id, "product_name": product_name, "sku": product_sku, "size": size, "radius_miles": 2500},
             confidence=1.0,
         )
 
@@ -62,7 +66,7 @@ class LoopMatcherAgent(BaseAgent):
             size=size,
             latitude=source_lat,
             longitude=source_lon,
-            radius_miles=50.0,
+            radius_miles=2500.0,
             exclude_customer_id=customer_id,
         )
 
@@ -144,7 +148,21 @@ class LoopMatcherAgent(BaseAgent):
 
         await self.db.commit()
 
-        # Step 5: Log final decision
+        # Step 5: Fulfill the target order in Shopify via Airbyte
+        fulfillment_result = await airbyte_service.fulfill_rerouted_order(
+            target_order_id=best["order_id"],
+            return_request_id=return_request_id,
+        )
+        await self.think(
+            return_request_id=return_request_id,
+            action="shopify_fulfillment",
+            reasoning=f"Triggered Shopify fulfillment for reroute target order {best['order_id']}. Result: {fulfillment_result}",
+            decision="fulfilled" if "error" not in fulfillment_result else f"fulfillment_skipped: {fulfillment_result.get('error')}",
+            data_used={"target_order_id": best["order_id"], "fulfillment": fulfillment_result},
+            confidence=0.95,
+        )
+
+        # Step 6: Log final decision
         await self.think(
             return_request_id=return_request_id,
             action="routing_decided",
@@ -353,7 +371,7 @@ Select the best candidate and explain why. Consider distance, recipient risk, an
         nearby = []
         for order in orders:
             dist = haversine_distance(lat, lon, order.latitude, order.longitude)
-            if dist <= 50:
+            if dist <= 2500:
                 nearby.append({
                     "order_id": order.id,
                     "customer_id": order.customer_id,

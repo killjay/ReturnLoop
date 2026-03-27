@@ -26,17 +26,34 @@ router = APIRouter()
 
 
 def verify_shopify_webhook(body: bytes, signature: str) -> bool:
-    """Verify Shopify webhook HMAC signature."""
-    if not settings.shopify_api_secret:
+    """Verify Shopify webhook HMAC signature.
+
+    Tries both the custom app secret and the OAuth app secret,
+    since webhooks may come from either app.
+    """
+    if not signature:
         return True
-    computed = base64.b64encode(
-        hmac.new(
-            settings.shopify_api_secret.encode(),
-            body,
-            hashlib.sha256,
-        ).digest()
-    ).decode()
-    return hmac.compare_digest(computed, signature)
+
+    secrets_to_try = [
+        settings.shopify_api_secret,
+        settings.shopify_oauth_client_secret,
+    ]
+
+    for secret in secrets_to_try:
+        if not secret:
+            continue
+        computed = base64.b64encode(
+            hmac.new(
+                secret.encode(),
+                body,
+                hashlib.sha256,
+            ).digest()
+        ).decode()
+        if hmac.compare_digest(computed, signature):
+            return True
+
+    print(f"  HMAC verification failed for both secrets. Signature: {signature[:20]}...")
+    return False
 
 
 def extract_shipping_coords(payload: dict) -> tuple:
@@ -137,6 +154,71 @@ async def enrich_customer_via_oauth(customer_id: str) -> dict:
     return {}
 
 
+async def enrich_customer_via_oauth_order(order_id: str) -> dict:
+    """Fetch full order + customer details via OAuth token for returns/request webhook.
+
+    The returns/request webhook only gives us order ID, not full customer/product data.
+    We need to fetch the order to get customer_id, product_id, shipping address, phone.
+    """
+    import asyncio, subprocess, json as _json
+    from backend.api.shopify_oauth import get_oauth_token, _oauth_tokens
+
+    token = get_oauth_token()
+    if not token or not _oauth_tokens:
+        return {}
+
+    shop = list(_oauth_tokens.keys())[0]
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["curl", "-s",
+                 f"https://{shop}/admin/api/2024-10/orders/{order_id}.json",
+                 "-H", f"X-Shopify-Access-Token: {token}"],
+                capture_output=True, text=True, timeout=15,
+            )
+        )
+        if result.returncode == 0 and result.stdout:
+            data = _json.loads(result.stdout)
+            o = data.get("order", {})
+            customer = o.get("customer") or {}
+            shipping = o.get("shipping_address") or {}
+            line_items = o.get("line_items", [])
+            first_item = line_items[0] if line_items else {}
+
+            customer_id = str(customer.get("id", ""))
+            phone = customer.get("phone", "") or shipping.get("phone", "")
+            name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+            if not name:
+                name = f"{shipping.get('first_name', '')} {shipping.get('last_name', '')}".strip()
+
+            addr = customer.get("default_address") or shipping or {}
+
+            print(f"  OAUTH ORDER ENRICHMENT: {name} | Phone: {phone} | Customer: {customer_id}")
+
+            return {
+                "customer_id": customer_id,
+                "customer_name": name or "Shopify Customer",
+                "phone": phone,
+                "email": customer.get("email", ""),
+                "address": addr.get("address1", ""),
+                "city": addr.get("city", ""),
+                "latitude": float(shipping.get("latitude", 0) or 0) or 37.7749,
+                "longitude": float(shipping.get("longitude", 0) or 0) or -122.4194,
+                "lifetime_value": float(customer.get("total_spent", 0) or 0),
+                "product_id": str(first_item.get("product_id", "")),
+                "product_name": first_item.get("title", "Product"),
+                "product_price": float(first_item.get("price", 0) or 0),
+                "size": first_item.get("variant_title", "M") or "M",
+                "total_price": float(o.get("total_price", 0) or 0),
+            }
+    except Exception as e:
+        print(f"  OAuth order enrichment failed: {e}")
+
+    return {}
+
+
 async def fallback_from_seed_db(customer_id: str, customer_name: str, db) -> dict:
     """Enrich customer data: first try OAuth API, then fall back to seed DB."""
     # Try OAuth enrichment first (gives real PII from Shopify)
@@ -203,9 +285,124 @@ async def handle_shopify_return(request: Request):
         _json.dump(payload, _f, indent=2, default=str)
     print(f"\nSHOPIFY WEBHOOK: {topic} | Payload saved to /tmp/shopify_webhook_latest.json")
 
-    # FILTER: Only process orders that have a return requested
-    # orders/updated fires on ANY change (fulfillment, payment, edit, return)
-    # We only trigger when: returns[] is non-empty, or refunds exist, or cancelled
+    # HANDLE returns/request topic (GraphQL webhook -- different payload structure)
+    # This webhook sends the Return object directly with order reference
+    if topic == "returns/request" or (payload.get("return_line_items") and not payload.get("line_items")):
+        print(f"SHOPIFY: returns/request webhook detected!")
+        return_items = payload.get("return_line_items", [])
+        raw_order_id = payload.get("order", {}).get("id", "")
+        shopify_order_id = str(raw_order_id).replace("gid://shopify/Order/", "")
+        return_reason = return_items[0].get("return_reason", "preference") if return_items else "preference"
+        return_reason_note = return_items[0].get("return_reason_note", "") if return_items else ""
+        customer_note = payload.get("customer_note", "") or return_reason_note
+
+        # Map Shopify reason to our categories
+        reason_map = {
+            "size_too_small": "sizing", "size_too_large": "sizing",
+            "wrong_item": "wrong_item", "defective": "damage",
+            "damaged": "damage", "quality": "quality",
+            "color": "preference", "style": "preference", "other": "preference",
+        }
+        reason_category = reason_map.get(return_reason, "preference")
+        reason_detail = customer_note or f"Return requested via Shopify: {return_reason}"
+
+        # Fetch order details via OAuth API to get customer info
+        enriched = await enrich_customer_via_oauth_order(shopify_order_id)
+
+        async with async_session() as db:
+            # Idempotency
+            existing = await db.execute(select(ReturnRequest).where(ReturnRequest.order_id == shopify_order_id))
+            if existing.scalar_one_or_none():
+                return {"status": "skipped", "reason": "Return already exists"}
+
+            # Get or create customer/product/order using enriched data
+            customer_id = enriched.get("customer_id", "")
+            product_id = enriched.get("product_id", "")
+            phone = enriched.get("phone", "")
+            customer_name = enriched.get("customer_name", "Shopify Customer")
+            latitude = enriched.get("latitude", 37.7749)
+            longitude = enriched.get("longitude", -122.4194)
+
+            # Ensure customer exists
+            if customer_id:
+                cust_check = await db.execute(select(Customer).where(or_(Customer.id == customer_id, Customer.id == f"shopify-{customer_id}")))
+                existing_cust = cust_check.scalar_one_or_none()
+                if existing_cust:
+                    customer_id = existing_cust.id
+                else:
+                    c = Customer(id=customer_id, name=customer_name, email=enriched.get("email", ""),
+                        phone=phone, address=enriched.get("address", ""), city=enriched.get("city", ""),
+                        state="", zip_code="", latitude=latitude, longitude=longitude,
+                        lifetime_value=enriched.get("lifetime_value", 0), total_orders=0)
+                    db.add(c)
+                    await db.flush()
+
+            # Ensure product exists
+            if product_id:
+                prod_check = await db.execute(select(Product).where(or_(Product.id == product_id, Product.id == f"shopify-{product_id}")))
+                existing_prod = prod_check.scalar_one_or_none()
+                if existing_prod:
+                    product_id = existing_prod.id
+                else:
+                    p = Product(id=product_id, sku=f"SHOP-{product_id}", name=enriched.get("product_name", "Product"),
+                        category="general", brand="", price=enriched.get("product_price", 0), cost=0)
+                    db.add(p)
+                    await db.flush()
+
+            # Ensure order exists
+            order_check = await db.execute(select(Order).where(or_(Order.id == shopify_order_id, Order.id == f"shopify-{shopify_order_id}")))
+            existing_order = order_check.scalar_one_or_none()
+            if existing_order:
+                order = existing_order
+            else:
+                order = Order(id=shopify_order_id, customer_id=customer_id, product_id=product_id,
+                    status="delivered", size=enriched.get("size", "M"), quantity=1,
+                    total_price=enriched.get("total_price", 0), shipping_address=enriched.get("address", ""),
+                    latitude=latitude, longitude=longitude)
+                db.add(order)
+                await db.flush()
+
+            await db.commit()
+
+            # Create return request
+            rr = ReturnRequest(order_id=order.id, customer_id=customer_id, product_id=product_id,
+                status="initiated", reason_category=reason_category, reason_detail=reason_detail,
+                item_condition="like_new")
+            db.add(rr)
+            await db.commit()
+            await db.refresh(rr)
+
+            order.status = "return_requested"
+            await db.commit()
+
+        # Emit event to trigger pipeline
+        await event_bus.emit(Event(
+            event_type=RETURN_INITIATED,
+            return_request_id=rr.id,
+            payload={
+                "order_id": order.id, "customer_id": customer_id, "product_id": product_id,
+                "customer_name": customer_name, "customer_phone": phone,
+                "customer_ltv": enriched.get("lifetime_value", 0),
+                "customer_return_rate": 0.1,
+                "product_name": enriched.get("product_name", "Product"),
+                "product_sku": "", "product_price": enriched.get("product_price", 0),
+                "product_return_rate": 0.12,
+                "size": enriched.get("size", "M"),
+                "latitude": latitude, "longitude": longitude,
+                "reason_category": reason_category, "reason_detail": reason_detail,
+                "item_condition": "like_new", "source": "shopify_returns_request",
+            },
+        ))
+
+        await ws_manager.broadcast_return_update({
+            "source": "shopify", "return_request_id": rr.id,
+            "order_id": order.id, "status": "initiated", "reason": reason_category,
+        })
+
+        print(f"RETURNS_REQUEST: Created return {rr.id} for order {shopify_order_id} | phone={phone} | reason={reason_category}")
+        return {"status": "ok", "return_request_id": rr.id}
+
+    # FILTER for orders/updated: Only process orders that have a return requested
     returns_data = payload.get("returns", [])
     refunds = payload.get("refunds", [])
     financial_status = payload.get("financial_status", "")
@@ -250,6 +447,20 @@ async def handle_shopify_return(request: Request):
 
     # Extract geo coordinates from shipping address
     latitude, longitude = extract_shipping_coords(payload)
+
+    # Nominatim geocode if Shopify didn't provide real coordinates
+    if not latitude or not longitude or (latitude == 37.7749 and longitude == -122.4194):
+        from backend.utils.geo import geocode_address
+        addr = shipping_addr or payload.get("billing_address") or {}
+        geo_lat, geo_lng = await geocode_address(
+            addr.get("address1", ""),
+            addr.get("city", ""),
+            addr.get("province") or "",
+            addr.get("zip") or "",
+            addr.get("country_code", "US"),
+        )
+        if geo_lat or geo_lng:
+            latitude, longitude = geo_lat, geo_lng
 
     # Extract phone from shipping address fallback
     phone = extract_phone(payload)
@@ -297,6 +508,70 @@ async def handle_shopify_return(request: Request):
             )
         )
         order = result.scalar_one_or_none()
+
+        # === Ensure ALL FK dependencies exist (PostgreSQL enforces strictly) ===
+
+        # 1. Enrich customer data via OAuth FIRST (gets real name/phone/address)
+        enriched = await enrich_customer_via_oauth(customer_id)
+
+        # 2. Create customer if not exists (check both raw and prefixed IDs)
+        if customer_id:
+            cust_check = await db.execute(
+                select(Customer).where(
+                    or_(Customer.id == customer_id, Customer.id == f"shopify-{customer_id}")
+                )
+            )
+            existing_customer = cust_check.scalar_one_or_none()
+            if existing_customer:
+                # Use the actual ID from DB (might be prefixed)
+                customer_id = existing_customer.id
+                print(f"  Found existing customer: {customer_id}")
+            if not existing_customer:
+                new_customer = Customer(
+                    id=customer_id,
+                    name=enriched.get("name") or f"{customer_data.get('first_name', '')} {customer_data.get('last_name', '')}".strip() or "Shopify Customer",
+                    email=enriched.get("email") or customer_data.get("email", "") or "",
+                    phone=enriched.get("phone") or extract_phone(payload) or "",
+                    address=enriched.get("address") or shipping_addr.get("address1", "") or "",
+                    city=enriched.get("city") or shipping_addr.get("city", "") or "",
+                    state=shipping_addr.get("province", "") or "",
+                    zip_code=shipping_addr.get("zip", "") or "",
+                    latitude=enriched.get("latitude") or latitude,
+                    longitude=enriched.get("longitude") or longitude,
+                    lifetime_value=enriched.get("lifetime_value") or float(customer_data.get("total_spent", 0) or 0),
+                    total_orders=int(customer_data.get("orders_count", 0) or 0),
+                )
+                db.add(new_customer)
+                await db.flush()
+                print(f"  Created customer: {customer_id} | {new_customer.name} | {new_customer.phone}")
+
+        # 3. Create product if not exists (FK constraint on orders.product_id)
+        webhook_product_id = str(first_item.get("product_id", "")) if first_item else ""
+        if webhook_product_id:
+            prod_check = await db.execute(
+                select(Product).where(
+                    or_(Product.id == webhook_product_id, Product.id == f"shopify-{webhook_product_id}")
+                )
+            )
+            existing_product = prod_check.scalar_one_or_none()
+            if existing_product:
+                webhook_product_id = existing_product.id
+                print(f"  Found existing product: {webhook_product_id}")
+            if not existing_product:
+                new_product = Product(
+                    id=webhook_product_id,
+                    sku=f"SHOP-{webhook_product_id}",
+                    name=first_item.get("title", "Shopify Product") if first_item else "Shopify Product",
+                    category="general",
+                    brand=first_item.get("vendor", "") if first_item else "",
+                    price=float(first_item.get("price", 0) or 0) if first_item else 0,
+                    cost=float(first_item.get("price", 0) or 0) * 0.4 if first_item else 0,
+                )
+                db.add(new_product)
+                await db.flush()
+                print(f"  Created product: {webhook_product_id} | {new_product.name}")
+
+        await db.commit()
 
         # If order not in DB, fetch from Shopify and create it
         if not order:
@@ -384,10 +659,7 @@ async def handle_shopify_return(request: Request):
         order.status = "return_requested"
         await db.commit()
 
-        # Enrich customer data via OAuth API (bypasses PII redaction)
-        enriched = await fallback_from_seed_db(customer_id, "", db)
-
-        # Apply enriched data
+        # Apply enriched data (enriched was fetched via OAuth earlier in this handler)
         if enriched:
             if enriched.get("phone") and not phone:
                 phone = enriched["phone"]

@@ -229,6 +229,37 @@ class AirbyteService:
             longitude=0.0,
         )
 
+    async def fulfill_rerouted_order(self, target_order_id: str, return_request_id: str = "") -> dict:
+        """Fulfill the reroute target order in Shopify via the Admin API.
+
+        Called after the Loop Matcher decides to reroute a return to a nearby customer.
+        Extracts the Shopify order ID from our internal ID (format: 'shopify-{id}'),
+        creates a fulfillment, then re-syncs to keep our DB in sync with Shopify.
+
+        Returns fulfillment result dict.
+        """
+        from backend.services.shopify_client import shopify_service
+
+        # Extract the raw Shopify numeric ID from 'shopify-{id}'
+        shopify_order_id = target_order_id.replace("shopify-", "") if target_order_id.startswith("shopify-") else target_order_id
+
+        if not shopify_order_id or not shopify_service.is_configured:
+            logger.warning("Cannot fulfill order %s — Shopify not configured or ID invalid", target_order_id)
+            return {"error": "Shopify not configured or invalid order ID"}
+
+        note = f"Rerouted return — ReturnLoop request {return_request_id}" if return_request_id else "Rerouted return via ReturnLoop"
+        result = await shopify_service.fulfill_order(shopify_order_id, note=note)
+
+        if "error" not in result:
+            logger.info("Fulfilled rerouted order %s via Shopify: %s", target_order_id, result)
+            # Re-sync to reflect the updated fulfillment status in our DB
+            await ws_manager.broadcast({
+                "type": "airbyte_sync",
+                "data": {"status": "fulfillment_created", "order_id": target_order_id, "shopify_order_id": shopify_order_id},
+            })
+
+        return result
+
     async def _mock_shopify_sync(self) -> dict:
         """Mock Shopify sync for demo -- simulates Airbyte pulling data."""
         import asyncio

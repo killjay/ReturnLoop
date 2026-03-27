@@ -1,9 +1,44 @@
+import asyncio
+import json
 import math
+import urllib.parse
+import urllib.request
 
 # Average CO2 per mile for ground shipping (kg)
 CO2_PER_MILE_KG = 0.00041 * 2000  # ~0.82 kg per mile for a delivery truck segment
 # Simplified: ~0.06 kg CO2 per mile per package
 CO2_PER_PACKAGE_MILE_KG = 0.06
+
+
+async def geocode_address(
+    address: str, city: str, state: str, zip_code: str, country: str = "US"
+) -> tuple:
+    """Geocode a shipping address to (lat, lng) using Nominatim (OpenStreetMap).
+
+    Returns (0.0, 0.0) if geocoding fails or no result is found.
+    Nominatim is free with no API key — rate limit is 1 req/sec.
+    """
+    parts = [p for p in [address, city, state, zip_code, country] if p and p.strip()]
+    if not parts:
+        return 0.0, 0.0
+
+    query = urllib.parse.urlencode({"q": ", ".join(parts), "format": "json", "limit": "1"})
+    url = f"https://nominatim.openstreetmap.org/search?{query}"
+
+    def _fetch():
+        req = urllib.request.Request(url, headers={"User-Agent": "ReturnLoop/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+
+    try:
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, _fetch)
+        if results:
+            return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception as e:
+        print(f"Geocoding failed for '{', '.join(parts)}': {e}")
+
+    return 0.0, 0.0
 
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

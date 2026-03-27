@@ -126,6 +126,48 @@ class ShopifyService:
             return data["customer"]
         return None
 
+    async def fulfill_order(self, shopify_order_id: str, tracking_number: str = "", note: str = "") -> dict:
+        """Fulfill a Shopify order by creating a fulfillment via the Admin API.
+
+        Uses the fulfillment orders flow (required since API 2022-07):
+        1. GET fulfillment_orders for the order to get the fulfillment_order_id
+        2. POST /fulfillments.json with that ID to create the fulfillment
+
+        Returns the created fulfillment dict, or an error dict.
+        """
+        # Step 1: Get the open fulfillment order(s) for this order
+        fo_data = await self._api_call("GET", f"orders/{shopify_order_id}/fulfillment_orders.json")
+        if not fo_data or "fulfillment_orders" not in fo_data:
+            return {"error": f"Could not fetch fulfillment orders for Shopify order {shopify_order_id}"}
+
+        open_fos = [
+            fo for fo in fo_data["fulfillment_orders"]
+            if fo.get("status") in ("open", "in_progress")
+        ]
+        if not open_fos:
+            return {"error": "No open fulfillment orders found — order may already be fulfilled"}
+
+        # Step 2: Create fulfillment against all open fulfillment orders
+        line_items_by_fo = [{"fulfillment_order_id": fo["id"]} for fo in open_fos]
+        payload = {
+            "fulfillment": {
+                "line_items_by_fulfillment_order": line_items_by_fo,
+                "notify_customer": True,
+            }
+        }
+        if tracking_number:
+            payload["fulfillment"]["tracking_info"] = {"number": tracking_number}
+        if note:
+            payload["fulfillment"]["origin_address"] = {}  # required field placeholder
+
+        result = await self._api_call("POST", "fulfillments.json", payload)
+        if result and "fulfillment" in result:
+            fulfillment = result["fulfillment"]
+            print(f"Shopify fulfillment created: id={fulfillment.get('id')} status={fulfillment.get('status')} order={shopify_order_id}")
+            return {"fulfillment_id": fulfillment.get("id"), "status": fulfillment.get("status")}
+
+        return {"error": f"Fulfillment creation failed: {result}"}
+
     async def get_products(self, limit: int = 50) -> list:
         """Fetch products from Shopify."""
         data = await self._api_call("GET", f"products.json?limit={limit}")
@@ -139,6 +181,7 @@ class ShopifyService:
         from backend.models.customer import Customer
         from backend.models.product import Product
         from backend.models.order import Order
+        from backend.utils.geo import geocode_address
         from sqlalchemy import select
         import uuid
 
@@ -149,10 +192,24 @@ class ShopifyService:
             customers = await self.get_customers()
             for c in customers:
                 cid = f"shopify-{c.get('id', '')}"
-                existing = await db.execute(select(Customer).where(Customer.id == cid))
-                if existing.scalar_one_or_none():
-                    continue
+                existing_result = await db.execute(select(Customer).where(Customer.id == cid))
+                existing_customer = existing_result.scalar_one_or_none()
                 addr = c.get("default_address") or {}
+                lat = float(addr.get("latitude", 0) or 0)
+                lng = float(addr.get("longitude", 0) or 0)
+                if not lat or not lng:
+                    lat, lng = await geocode_address(
+                        addr.get("address1", ""),
+                        addr.get("city", ""),
+                        addr.get("province") or "",
+                        addr.get("zip") or "",
+                        addr.get("country_code", "US"),
+                    )
+                if existing_customer:
+                    if (not existing_customer.latitude or not existing_customer.longitude) and (lat or lng):
+                        existing_customer.latitude = lat
+                        existing_customer.longitude = lng
+                    continue
                 customer = Customer(
                     id=cid,
                     name=f"{c.get('first_name', '')} {c.get('last_name', '')}".strip(),
@@ -160,10 +217,10 @@ class ShopifyService:
                     phone=c.get("phone", ""),
                     address=addr.get("address1", ""),
                     city=addr.get("city", ""),
-                    state=addr.get("province", ""),
-                    zip_code=addr.get("zip", ""),
-                    latitude=float(addr.get("latitude", 0) or 0),
-                    longitude=float(addr.get("longitude", 0) or 0),
+                    state=addr.get("province") or "",
+                    zip_code=addr.get("zip") or "",
+                    latitude=lat,
+                    longitude=lng,
                     lifetime_value=float(c.get("total_spent", 0) or 0),
                     total_orders=int(c.get("orders_count", 0) or 0),
                 )
@@ -201,24 +258,47 @@ class ShopifyService:
             # Sync orders
             orders = await self.get_orders()
             for o in orders:
+                if not (o.get("customer") or {}).get("id"):
+                    continue  # skip guest checkout orders — no customer to link
                 oid = f"shopify-{o.get('id', '')}"
-                existing = await db.execute(select(Order).where(Order.id == oid))
-                if existing.scalar_one_or_none():
-                    continue
+                existing_result = await db.execute(select(Order).where(Order.id == oid))
+                existing_order = existing_result.scalar_one_or_none()
                 shipping = o.get("shipping_address") or {}
                 line_items = o.get("line_items", [])
                 first_item = line_items[0] if line_items else {}
+                o_lat = float(shipping.get("latitude", 0) or 0)
+                o_lng = float(shipping.get("longitude", 0) or 0)
+                if not o_lat or not o_lng:
+                    # Fall back to customer coords if shipping has no address
+                    cid = f"shopify-{(o.get('customer') or {}).get('id', '')}"
+                    cust_result = await db.execute(select(Customer).where(Customer.id == cid))
+                    cust = cust_result.scalar_one_or_none()
+                    if cust and (cust.latitude or cust.longitude):
+                        o_lat, o_lng = cust.latitude, cust.longitude
+                    else:
+                        o_lat, o_lng = await geocode_address(
+                            shipping.get("address1", ""),
+                            shipping.get("city", ""),
+                            shipping.get("province") or "",
+                            shipping.get("zip") or "",
+                            shipping.get("country_code", "US"),
+                        )
+                if existing_order:
+                    if (not existing_order.latitude or not existing_order.longitude) and (o_lat or o_lng):
+                        existing_order.latitude = o_lat
+                        existing_order.longitude = o_lng
+                    continue
                 order = Order(
                     id=oid,
-                    customer_id=f"shopify-{o.get('customer', {}).get('id', '')}",
+                    customer_id=f"shopify-{(o.get('customer') or {}).get('id', '')}",
                     product_id=f"shopify-{first_item.get('product_id', '')}" if first_item.get("product_id") else "",
                     status="delivered" if o.get("fulfillment_status") == "fulfilled" else "pending",
-                    size=first_item.get("variant_title", "M") or "M",
+                    size=(first_item.get("variant_title") or "M")[:10],
                     quantity=int(first_item.get("quantity", 1)) if first_item else 1,
                     total_price=float(o.get("total_price", 0) or 0),
                     shipping_address=shipping.get("address1", ""),
-                    latitude=float(shipping.get("latitude", 0) or 0),
-                    longitude=float(shipping.get("longitude", 0) or 0),
+                    latitude=o_lat,
+                    longitude=o_lng,
                 )
                 db.add(order)
                 counts["orders"] += 1
