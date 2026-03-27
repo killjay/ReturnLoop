@@ -3,10 +3,14 @@
 Pulls customers, products, and orders via the Airbyte Shopify connector,
 mapping records into the Return Loop data model.
 """
+import json
+import os
 import uuid
 import logging
 from datetime import datetime
 from typing import Optional
+
+_STATE_FILE = os.path.join(os.path.dirname(__file__), "../../.airbyte_state.json")
 
 from airbyte_agent_shopify import ShopifyConnector
 from airbyte_agent_shopify.models import ShopifyAuthConfig
@@ -25,10 +29,37 @@ class AirbyteService:
 
     def __init__(self):
         self._last_sync = None
-        self._sync_status = "idle"  # idle, syncing, completed, error
+        self._sync_status = "idle"
         self._sync_counts = {"customers": 0, "products": 0, "orders": 0}
         self._connected_sources = []
         self._connector: Optional[ShopifyConnector] = None
+        self._load_state()
+
+    def _load_state(self):
+        """Restore sync state from disk so restarts don't wipe the status."""
+        try:
+            with open(_STATE_FILE) as f:
+                state = json.load(f)
+            self._sync_status = state.get("sync_status", "idle")
+            self._sync_counts = state.get("sync_counts", self._sync_counts)
+            self._connected_sources = state.get("connected_sources", [])
+            last_sync = state.get("last_sync")
+            self._last_sync = datetime.fromisoformat(last_sync) if last_sync else None
+        except (FileNotFoundError, Exception):
+            pass  # first run or corrupt file — start fresh
+
+    def _save_state(self):
+        """Persist sync state to disk."""
+        try:
+            with open(_STATE_FILE, "w") as f:
+                json.dump({
+                    "sync_status": self._sync_status,
+                    "sync_counts": self._sync_counts,
+                    "connected_sources": self._connected_sources,
+                    "last_sync": self._last_sync.isoformat() if self._last_sync else None,
+                }, f)
+        except Exception as e:
+            logger.warning("Could not save Airbyte state: %s", e)
 
     @property
     def status(self) -> dict:
@@ -109,21 +140,39 @@ class AirbyteService:
             counts = {"customers": 0, "products": 0, "orders": 0}
 
             async with async_session() as db:
+                from sqlalchemy import select
+
                 for record in customers_data:
                     customer = self._map_shopify_customer(record)
-                    if customer:
+                    if not customer:
+                        continue
+                    existing = await db.execute(select(Customer).where(Customer.id == customer.id))
+                    if not existing.scalar_one_or_none():
                         db.add(customer)
                         counts["customers"] += 1
 
+                await db.flush()
+
                 for record in products_data:
                     product = self._map_shopify_product(record)
-                    if product:
+                    if not product:
+                        continue
+                    existing = await db.execute(select(Product).where(Product.id == product.id))
+                    if not existing.scalar_one_or_none():
+                        sku_check = await db.execute(select(Product).where(Product.sku == product.sku))
+                        if sku_check.scalar_one_or_none():
+                            product.sku = f"{product.sku}-{product.id[-6:]}"
                         db.add(product)
                         counts["products"] += 1
 
+                await db.flush()
+
                 for record in orders_data:
                     order = self._map_shopify_order(record)
-                    if order:
+                    if not order:
+                        continue
+                    existing = await db.execute(select(Order).where(Order.id == order.id))
+                    if not existing.scalar_one_or_none():
                         db.add(order)
                         counts["orders"] += 1
 
@@ -134,6 +183,7 @@ class AirbyteService:
             self._sync_status = "completed"
             if "shopify" not in self._connected_sources:
                 self._connected_sources.append("shopify")
+            self._save_state()
 
             await ws_manager.broadcast({
                 "type": "airbyte_sync",
@@ -145,6 +195,7 @@ class AirbyteService:
 
         except Exception as e:
             self._sync_status = "error"
+            self._save_state()
             logger.exception("Shopify sync failed")
             await ws_manager.broadcast({
                 "type": "airbyte_sync",
@@ -271,6 +322,7 @@ class AirbyteService:
         self._sync_status = "completed"
         if "shopify" not in self._connected_sources:
             self._connected_sources.append("shopify (demo)")
+        self._save_state()
 
         await ws_manager.broadcast({
             "type": "airbyte_sync",
